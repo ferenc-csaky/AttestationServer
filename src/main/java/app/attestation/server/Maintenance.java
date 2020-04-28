@@ -8,17 +8,18 @@ import com.almworks.sqlite4java.SQLiteStatement;
 import java.io.File;
 
 class Maintenance implements Runnable {
+    private static final File ATTESTATION_DB_FILE = new File(AttestationProtocol.ATTESTATION_DB);
     private static final long WAIT_MS = 24 * 60 * 60 * 1000;
     private static final int DELETE_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 
     @Override
     public void run() {
-        final SQLiteConnection conn = new SQLiteConnection(AttestationProtocol.ATTESTATION_DATABASE);
+        final SQLiteConnection conn = new SQLiteConnection(ATTESTATION_DB_FILE);
         final SQLiteStatement deleteDeletedDevices;
         final SQLiteStatement selectBackups;
         final SQLiteStatement updateBackups;
         try {
-            AttestationServer.open(conn, false);
+            open(conn, false);
             deleteDeletedDevices = conn.prepare("DELETE FROM Devices WHERE deletionTime < ?");
             selectBackups = conn.prepare("SELECT value FROM Configuration WHERE key = 'backups'");
             updateBackups = conn.prepare("UPDATE Configuration SET value = value + 1 " +
@@ -63,5 +64,16 @@ class Maintenance implements Runnable {
                 }
             }
         }
+    }
+
+    private void open(final SQLiteConnection conn, final boolean readOnly) throws SQLiteException {
+        if (readOnly) {
+            conn.openReadonly();
+        } else {
+            conn.open();
+        }
+        conn.setBusyTimeout(SQLUtil.BUSY_TIMEOUT);
+        conn.exec("PRAGMA foreign_keys=ON");
+        conn.exec("PRAGMA journal_mode=WAL");
     }
 }

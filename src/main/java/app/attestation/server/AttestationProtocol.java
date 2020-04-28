@@ -1,9 +1,5 @@
 package app.attestation.server;
 
-import com.almworks.sqlite4java.SQLiteConnection;
-import com.almworks.sqlite4java.SQLiteException;
-import com.almworks.sqlite4java.SQLiteStatement;
-
 import com.github.benmanes.caffeine.cache.Cache;
 
 import com.google.common.collect.ImmutableMap;
@@ -11,6 +7,9 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.hash.HashFunction;
 import com.google.common.hash.Hashing;
 import com.google.common.io.BaseEncoding;
+
+import org.apache.commons.dbutils.QueryRunner;
+import org.apache.commons.dbutils.handlers.BeanHandler;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -30,6 +29,7 @@ import java.security.cert.CertificateEncodingException;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
@@ -43,9 +43,11 @@ import app.attestation.server.attestation.AttestationApplicationId;
 import app.attestation.server.attestation.AttestationPackageInfo;
 import app.attestation.server.attestation.AuthorizationList;
 import app.attestation.server.attestation.RootOfTrust;
+import app.attestation.server.dto.PinnedDeviceDTO;
 
+@SuppressWarnings({"SqlNoDataSourceInspection", "SqlResolve"})
 class AttestationProtocol {
-    static final File ATTESTATION_DATABASE = new File("attestation.db");
+    static final String ATTESTATION_DB = "attestation.db";
 
     // Developer previews set osVersion to 0 as a placeholder value.
     private static final int DEVELOPER_PREVIEW_OS_VERSION = 0;
@@ -798,6 +800,10 @@ class AttestationProtocol {
         return value ? "yes" : "no";
     }
 
+    private static int asInt(final boolean value) {
+        return value ? 1 : 0;
+    }
+
     private static void verify(final byte[] fingerprint,
             final Cache<ByteBuffer, Boolean> pendingChallenges, final long userId,
             final boolean paired, final ByteBuffer signedMessage, final byte[] signature,
@@ -814,46 +820,27 @@ class AttestationProtocol {
             throw new GeneralSecurityException("must be authenticated with subscribeKey for initial verification");
         }
 
-        final SQLiteConnection conn = new SQLiteConnection(ATTESTATION_DATABASE);
+        QueryRunner runner = SQLUtil.initQueryRunner(ATTESTATION_DB, false);
         try {
-            AttestationServer.open(conn, false);
-
-            final byte[][] pinnedCertificates = new byte[3][];
-            byte[] pinnedVerifiedBootKey = null;
-            int pinnedOsVersion = Integer.MAX_VALUE;
-            int pinnedOsPatchLevel = Integer.MAX_VALUE;
-            int pinnedVendorPatchLevel = 0;
-            int pinnedBootPatchLevel = 0;
-            int pinnedAppVersion = Integer.MAX_VALUE;
-            int pinnedSecurityLevel = 1;
+            PinnedDeviceDTO pdData = null;
             if (hasPersistentKey) {
-                final SQLiteStatement st = conn.prepare("SELECT pinnedCertificate0, " +
+                String selectQuery = "SELECT pinnedCertificate0, " +
                         "pinnedCertificate1, pinnedCertificate2, pinnedVerifiedBootKey, " +
                         "pinnedOsVersion, pinnedOsPatchLevel, pinnedVendorPatchLevel, " +
                         "pinnedBootPatchLevel, pinnedAppVersion, pinnedSecurityLevel, userId " +
-                        "FROM Devices WHERE fingerprint = ?");
-                st.bind(1, fingerprint);
-                if (st.step()) {
-                    pinnedCertificates[0] = st.columnBlob(0);
-                    pinnedCertificates[1] = st.columnBlob(1);
-                    pinnedCertificates[2] = st.columnBlob(2);
-                    pinnedVerifiedBootKey = st.columnBlob(3);
-                    pinnedOsVersion = st.columnInt(4);
-                    pinnedOsPatchLevel = st.columnInt(5);
-                    pinnedVendorPatchLevel = st.columnInt(6);
-                    pinnedBootPatchLevel = st.columnInt(7);
-                    pinnedAppVersion = st.columnInt(8);
-                    pinnedSecurityLevel = st.columnInt(9);
-                    if (userId != st.columnLong(10)) {
-                        throw new GeneralSecurityException("wrong userId");
-                    }
-                    st.dispose();
-                } else {
-                    st.dispose();
-                    throw new GeneralSecurityException(
-                            "Pairing data for this Auditee is missing. Cannot perform paired attestation.\n" +
+                        "FROM Devices WHERE fingerprint = ?";
+                pdData = runner.query(selectQuery, new BeanHandler<>(PinnedDeviceDTO.class), (Object) fingerprint);
+
+                if (pdData == null) {
+                    throw new GeneralSecurityException("Pairing data for this Auditee is missing. " +
+                            "Cannot perform paired attestation.\n" +
                             "\nEither the initial pairing was incomplete or the device is compromised.\n" +
-                            "\nIf the initial pairing was simply not completed, clear the pairing data on either the Auditee or the Auditor via the menu and try again.\n");
+                            "\nIf the initial pairing was simply not completed, clear the pairing data on " +
+                            "either the Auditee or the Auditor via the menu and try again.\n");
+                }
+
+                if (pdData.getUserId() != userId) {
+                    throw new GeneralSecurityException("wrong userId");
                 }
             }
 
@@ -868,7 +855,13 @@ class AttestationProtocol {
                 throw new GeneralSecurityException("currently only support certificate chains with length 4");
             }
 
+            Integer vendorPatchLevel = verified.vendorPatchLevel == 0 ? null : verified.vendorPatchLevel;
+            Integer bootPatchLevel = verified.bootPatchLevel == 0 ? null : verified.bootPatchLevel;
+            Integer systemUserInt = verified.appVersion < 14 ? null : asInt(systemUser);
+            int deviceAdminInt = deviceAdmin ? (deviceAdminNonSystem ? 2 : 1) : 0;
+
             if (hasPersistentKey) {
+                byte[][] pinnedCertificates = pdData.getPinnedCertificates();
                 for (int i = 1; i < attestationCertificates.length - 1; i++) {
                     if (!Arrays.equals(attestationCertificates[i].getEncoded(), pinnedCertificates[i])) {
                         throw new GeneralSecurityException("certificate chain mismatch");
@@ -882,6 +875,7 @@ class AttestationProtocol {
                 }
                 verifySignature(persistentCertificate.getPublicKey(), signedMessage, signature);
 
+                byte[] pinnedVerifiedBootKey = pdData.getPinnedVerifiedBootKey();
                 if (!Arrays.equals(verifiedBootKey, pinnedVerifiedBootKey)) {
                     final String legacyFingerprint = fingerprintsMigration.get(verified.verifiedBootKey);
                     if (legacyFingerprint != null && legacyFingerprint.equals(BaseEncoding.base16().encode(pinnedVerifiedBootKey))) {
@@ -890,107 +884,61 @@ class AttestationProtocol {
                         throw new GeneralSecurityException("pinned verified boot key mismatch");
                     }
                 }
-                if (verified.osVersion < pinnedOsVersion) {
+                if (verified.osVersion < pdData.getPinnedOsVersion()) {
                     throw new GeneralSecurityException("OS version downgrade detected");
                 }
-                if (verified.osPatchLevel < pinnedOsPatchLevel) {
+                if (verified.osPatchLevel < pdData.getPinnedOsPatchLevel()) {
                     throw new GeneralSecurityException("OS patch level downgrade detected");
                 }
-                if (verified.vendorPatchLevel < pinnedVendorPatchLevel) {
+                if (verified.vendorPatchLevel < pdData.getPinnedVendorPatchLevel()) {
                     throw new GeneralSecurityException("Vendor patch level downgrade detected");
                 }
-                if (verified.bootPatchLevel < pinnedBootPatchLevel) {
+                if (verified.bootPatchLevel < pdData.getPinnedBootPatchLevel()) {
                     throw new GeneralSecurityException("Boot patch level downgrade detected");
                 }
-                if (verified.appVersion < pinnedAppVersion) {
+                if (verified.appVersion < pdData.getPinnedAppVersion()) {
                     throw new GeneralSecurityException("App version downgraded");
                 }
-                if (verified.securityLevel != pinnedSecurityLevel) {
+                if (verified.securityLevel != pdData.getPinnedSecurityLevel()) {
                     throw new GeneralSecurityException("Security level mismatch");
                 }
 
                 appendVerifiedInformation(teeEnforced, verified);
 
-                final SQLiteStatement update = conn.prepare("UPDATE Devices SET " +
+                String updateQuery = "UPDATE Devices SET " +
                         "pinnedVerifiedBootKey = ?, verifiedBootHash = ?, " +
                         "pinnedOsVersion = ?, pinnedOsPatchLevel = ?, " +
                         "pinnedVendorPatchLevel = ?, pinnedBootPatchLevel = ?, " +
-                        "pinnedAppVersion = ?, pinnedSecurityLevel = ?, userProfileSecure = ?, enrolledFingerprints = ?, " +
-                        "accessibility = ?, deviceAdmin = ?, adbEnabled = ?, " +
+                        "pinnedAppVersion = ?, pinnedSecurityLevel = ?, userProfileSecure = ?, " +
+                        "enrolledFingerprints = ?, accessibility = ?, deviceAdmin = ?, adbEnabled = ?, " +
                         "addUsersWhenLocked = ?, denyNewUsb = ?, oemUnlockAllowed = ?, " +
                         "systemUser = ?, verifiedTimeLast = ? " +
-                        "WHERE fingerprint = ?");
-                // handle migration to v2 verified boot key fingerprint
-                update.bind(1, verifiedBootKey);
-                update.bind(2, verified.verifiedBootHash);
-                update.bind(3, verified.osVersion);
-                update.bind(4, verified.osPatchLevel);
-                if (verified.vendorPatchLevel != 0) {
-                    update.bind(5, verified.vendorPatchLevel);
-                }
-                if (verified.bootPatchLevel != 0) {
-                    update.bind(6, verified.bootPatchLevel);
-                }
-                update.bind(7, verified.appVersion);
-                update.bind(8, verified.securityLevel); // new field
-                update.bind(9, userProfileSecure ? 1 : 0);
-                update.bind(10, enrolledFingerprints ? 1 : 0);
-                update.bind(11, accessibility ? 1 : 0);
-                update.bind(12, deviceAdmin ? (deviceAdminNonSystem ? 2 : 1) : 0);
-                update.bind(13, adbEnabled ? 1 : 0);
-                update.bind(14, addUsersWhenLocked ? 1 : 0);
-                update.bind(15, denyNewUsb ? 1 : 0);
-                update.bind(16, oemUnlockAllowed ? 1 : 0);
-                if (verified.appVersion >= 14) {
-                    update.bind(17, systemUser ? 1 : 0);
-                }
-                update.bind(18, now);
-                update.bind(19, fingerprint);
-                update.step();
-                update.dispose();
+                        "WHERE fingerprint = ?";
+
+                runner.update(updateQuery, verifiedBootKey, verified.verifiedBootHash, verified.osVersion,
+                        verified.osPatchLevel, vendorPatchLevel, bootPatchLevel, verified.appVersion,
+                        verified.securityLevel, asInt(userProfileSecure), asInt(enrolledFingerprints),
+                        asInt(accessibility), deviceAdminInt, asInt(adbEnabled), asInt(addUsersWhenLocked),
+                        asInt(denyNewUsb), asInt(oemUnlockAllowed), systemUserInt, now, fingerprint);
             } else {
                 verifySignature(attestationCertificates[0].getPublicKey(), signedMessage, signature);
 
-                final SQLiteStatement insert = conn.prepare("INSERT INTO Devices " +
+                String insertQuery = "INSERT INTO Devices " +
                         "(fingerprint, pinnedCertificate0, pinnedCertificate1, pinnedCertificate2, " +
                         "pinnedVerifiedBootKey, verifiedBootHash, pinnedOsVersion, pinnedOsPatchLevel, " +
                         "pinnedVendorPatchLevel, pinnedBootPatchLevel, pinnedAppVersion, pinnedSecurityLevel, " +
                         "userProfileSecure, enrolledFingerprints, accessibility, deviceAdmin, " +
                         "adbEnabled, addUsersWhenLocked, denyNewUsb, oemUnlockAllowed, systemUser, " +
                         "verifiedTimeFirst, verifiedTimeLast, userId) " +
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-                insert.bind(1, fingerprint);
-                insert.bind(2, attestationCertificates[0].getEncoded());
-                insert.bind(3, attestationCertificates[1].getEncoded());
-                insert.bind(4, attestationCertificates[2].getEncoded());
-                insert.bind(5, verifiedBootKey);
-                insert.bind(6, verified.verifiedBootHash);
-                insert.bind(7, verified.osVersion);
-                insert.bind(8, verified.osPatchLevel);
-                if (verified.vendorPatchLevel != 0) {
-                    insert.bind(9, verified.vendorPatchLevel);
-                }
-                if (verified.bootPatchLevel != 0) {
-                    insert.bind(10, verified.bootPatchLevel);
-                }
-                insert.bind(11, verified.appVersion);
-                insert.bind(12, verified.securityLevel);
-                insert.bind(13, userProfileSecure ? 1 : 0);
-                insert.bind(14, enrolledFingerprints ? 1 : 0);
-                insert.bind(15, accessibility ? 1 : 0);
-                insert.bind(16, deviceAdmin ? (deviceAdminNonSystem ? 2 : 1) : 0);
-                insert.bind(17, adbEnabled ? 1 : 0);
-                insert.bind(18, addUsersWhenLocked ? 1 : 0);
-                insert.bind(19, denyNewUsb ? 1 : 0);
-                insert.bind(20, oemUnlockAllowed ? 1 : 0);
-                if (verified.appVersion >= 14) {
-                    insert.bind(21, systemUser ? 1 : 0);
-                }
-                insert.bind(22, now);
-                insert.bind(23, now);
-                insert.bind(24, userId);
-                insert.step();
-                insert.dispose();
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+                runner.update(insertQuery, fingerprint, attestationCertificates[0].getEncoded(),
+                        attestationCertificates[1].getEncoded(), attestationCertificates[2].getEncoded(),
+                        verifiedBootKey, verified.verifiedBootHash, verified.osVersion, verified.osPatchLevel,
+                        vendorPatchLevel, bootPatchLevel, verified.appVersion, verified.securityLevel,
+                        asInt(userProfileSecure), asInt(enrolledFingerprints), asInt(accessibility), deviceAdminInt,
+                        asInt(adbEnabled), asInt(addUsersWhenLocked), asInt(denyNewUsb), asInt(oemUnlockAllowed),
+                        systemUserInt, now, now, userId);
 
                 appendVerifiedInformation(teeEnforced, verified);
             }
@@ -1030,20 +978,12 @@ class AttestationProtocol {
             final String teeEnforcedString = teeEnforced.toString();
             final String osEnforcedString = osEnforced.toString();
 
-            final SQLiteStatement insert = conn.prepare("INSERT INTO Attestations " +
-                    "(fingerprint, time, strong, teeEnforced, osEnforced)" +
-                    "VALUES (?, ?, ?, ?, ?)");
-            insert.bind(1, fingerprint);
-            insert.bind(2, now);
-            insert.bind(3, hasPersistentKey ? 1 : 0);
-            insert.bind(4, teeEnforcedString);
-            insert.bind(5, osEnforcedString);
-            insert.step();
-            insert.dispose();
-        } catch (final SQLiteException e) {
+            String insert = "INSERT INTO Attestations (fingerprint, time, strong, teeEnforced, osEnforced)" +
+                    "VALUES (?, ?, ?, ?, ?)";
+
+            runner.update(insert, fingerprint, now, asInt(hasPersistentKey), teeEnforcedString, osEnforcedString);
+        } catch (SQLException e) {
             throw new IOException(e);
-        } finally {
-            conn.dispose();
         }
     }
 
